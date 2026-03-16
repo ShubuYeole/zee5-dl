@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import math
 import os
 import re
 import shutil
@@ -38,7 +39,7 @@ from rich.console import Console
 from rich.prompt import Prompt
 from rich.table import Table
 
-from .log import log, VERBOSITY
+from .log import VERBOSITY, log
 
 console = Console()
 
@@ -228,7 +229,8 @@ def parse_mpd(mpd_text: str, base_url: str) -> list[Track]:
                         _parse_duration(root.get("mediaPresentationDuration", ""))
                     )
                     if duration and period_dur:
-                        count = int(period_dur * timescale / duration) + 2
+                        # Use a conservative segment count to avoid 404 tail segments.
+                        count = int(math.ceil(period_dur * timescale / duration))
                         for i in range(start_num, start_num + count):
                             seg_url = resolve(
                                 media_tmpl.replace("$Number$", str(i))
@@ -1008,7 +1010,7 @@ async def download_content(
     _check_tool("aria2c")
     _check_tool("ffmpeg")
 
-    from .paths import temp_dir, downloads_dir
+    from .paths import downloads_dir, temp_dir
 
     if not output_dir or output_dir == Path("."):
         output_dir = downloads_dir()
