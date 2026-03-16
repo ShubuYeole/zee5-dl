@@ -38,7 +38,7 @@ from rich.console import Console
 from rich.prompt import Prompt
 from rich.table import Table
 
-from .log import log
+from .log import log, VERBOSITY
 
 console = Console()
 
@@ -53,8 +53,10 @@ _NS = {
 
 @dataclass
 class Segment:
-    url: str
-    index: int = 0
+    url:        str
+    index:      int  = 0
+    init_range: str  = ""   # e.g. "0-707" for SegmentBase init
+    full_range: str  = ""   # e.g. "708-1234567" for byte-range segment
 
 
 @dataclass
@@ -182,52 +184,121 @@ def parse_mpd(mpd_text: str, base_url: str) -> list[Track]:
                 channels = _parse_channels(ach.get("value", "")) or channels
 
             rt = _find(rep, "SegmentTemplate") or seg_tmpl
-            if rt is None:
-                continue
+            if rt is not None:
+                # ── SegmentTemplate (new-style, most ZEE5 content) ────────
+                init_tmpl  = rt.get("initialization", "")
+                media_tmpl = rt.get("media", "")
+                timescale  = int(rt.get("timescale", 1))
+                start_num  = int(rt.get("startNumber", 1))
 
-            init_tmpl  = rt.get("initialization", "")
-            media_tmpl = rt.get("media", "")
-            timescale  = int(rt.get("timescale", 1))
-            start_num  = int(rt.get("startNumber", 1))
+                def resolve(tmpl: str) -> str:
+                    t = tmpl.replace("$RepresentationID$", rid)
+                    t = t.replace("$Bandwidth$", str(bandwidth))
+                    if not t.startswith("http"):
+                        t = urljoin(base_url, t)
+                    return t
 
-            def resolve(tmpl: str) -> str:
-                t = tmpl.replace("$RepresentationID$", rid)
-                t = t.replace("$Bandwidth$", str(bandwidth))
-                if not t.startswith("http"):
-                    t = urljoin(base_url, t)
-                return t
+                init_url   = resolve(init_tmpl)
+                segments: list[Segment] = []
 
-            init_url = resolve(init_tmpl)
-            segments: list[Segment] = []
+                timeline = _find(rt, "SegmentTimeline")
+                if timeline is not None:
+                    seg_num = start_num
+                    t_val   = 0
+                    for s in _findall(timeline, "S"):
+                        if s.get("t"):
+                            t_val = int(s.get("t"))
+                        d_val = int(s.get("d", 0))
+                        r_val = int(s.get("r", 0))
+                        for _ in range(r_val + 1):
+                            seg_url = resolve(
+                                media_tmpl
+                                .replace("$Number$", str(seg_num))
+                                .replace("$Time$", str(t_val))
+                            )
+                            segments.append(Segment(url=seg_url, index=seg_num))
+                            seg_num += 1
+                            t_val   += d_val
+                else:
+                    duration   = int(rt.get("duration", 0))
+                    # Period duration may be on the Period element or on the root MPD
+                    # as mediaPresentationDuration — check both
+                    period_dur = (
+                        _parse_duration(period.get("duration", "")) or
+                        _parse_duration(root.get("mediaPresentationDuration", ""))
+                    )
+                    if duration and period_dur:
+                        count = int(period_dur * timescale / duration) + 2
+                        for i in range(start_num, start_num + count):
+                            seg_url = resolve(
+                                media_tmpl.replace("$Number$", str(i))
+                            )
+                            segments.append(Segment(url=seg_url, index=i))
 
-            timeline = _find(rt, "SegmentTimeline")
-            if timeline is not None:
-                seg_num = start_num
-                t_val   = 0
-                for s in _findall(timeline, "S"):
-                    if s.get("t"):
-                        t_val = int(s.get("t"))
-                    d_val = int(s.get("d", 0))
-                    r_val = int(s.get("r", 0))
-                    for _ in range(r_val + 1):
-                        seg_url = resolve(
-                            media_tmpl
-                            .replace("$Number$", str(seg_num))
-                            .replace("$Time$", str(t_val))
-                        )
-                        segments.append(Segment(url=seg_url, index=seg_num))
-                        seg_num += 1
-                        t_val   += d_val
             else:
-                duration   = int(rt.get("duration", 0))
-                period_dur = _parse_duration(period.get("duration", ""))
-                if duration and period_dur:
-                    count = int(period_dur * timescale / duration) + 2
-                    for i in range(start_num, start_num + count):
-                        seg_url = resolve(
-                            media_tmpl.replace("$Number$", str(i))
-                        )
-                        segments.append(Segment(url=seg_url, index=i))
+                # ── SegmentBase / SegmentList (old-style single-file MP4s) ─
+                # The whole track is a single URL with byte-range requests.
+                # Build a BaseURL for the representation.
+                base_url_el = (_find(rep, "BaseURL") or
+                               _find(adapt, "BaseURL") or
+                               _find(period, "BaseURL") or
+                               _find(root, "BaseURL"))
+                file_url = base_url_el.text.strip() if base_url_el is not None else ""
+                if not file_url:
+                    continue
+                if not file_url.startswith("http"):
+                    file_url = urljoin(base_url, file_url)
+
+                seg_base = (_find(rep, "SegmentBase") or
+                            _find(adapt, "SegmentBase"))
+
+                if seg_base is not None:
+                    # Single-segment: init range + one media segment (full file)
+                    init_range = seg_base.get("initialization", "")
+                    # init_range may be on a child Initialization element
+                    init_el = _find(seg_base, "Initialization")
+                    if init_el is not None:
+                        init_range = init_el.get("range", init_range)
+                    init_url  = file_url   # whole file; downloader uses range header
+                    # Wrap the whole file as a single "segment" with range hint
+                    index_range = seg_base.get("indexRange", "")
+                    segments    = [Segment(
+                        url   = file_url,
+                        index = 0,
+                        # Store init_range and index_range in the URL as hints
+                        # download handles byte-range via headers
+                    )]
+                    # Attach range info so _download_segbase can read it
+                    segments[0] = Segment(
+                        url        = file_url,
+                        index      = 0,
+                        init_range = init_range,
+                        full_range = "",   # no range = full file
+                    )
+                    init_url = file_url
+
+                else:
+                    # SegmentList — explicit list of URLs / ranges
+                    seg_list = _find(rep, "SegmentList") or _find(adapt, "SegmentList")
+                    if seg_list is None:
+                        continue
+                    init_el  = _find(seg_list, "Initialization")
+                    init_url = file_url
+                    if init_el is not None:
+                        src = init_el.get("sourceURL", "")
+                        init_url = urljoin(base_url, src) if src else file_url
+                    segments = []
+                    for idx, su in enumerate(_findall(seg_list, "SegmentURL")):
+                        media_src = su.get("media", file_url)
+                        seg_url   = urljoin(base_url, media_src) \
+                                    if not media_src.startswith("http") else media_src
+                        media_range = su.get("mediaRange", "")
+                        segments.append(Segment(
+                            url        = seg_url,
+                            index      = idx,
+                            init_range = "",
+                            full_range = media_range,
+                        ))
 
             tracks.append(Track(
                 track_id   = rid,
@@ -602,15 +673,19 @@ def _check_tool(name: str) -> str:
     return path
 
 
-def _write_aria2_input(urls: list[str], out_dir: Path) -> Path:
-    """Write aria2c input file (one URL + output filename per entry)."""
-    inp = out_dir / "aria2_input.txt"
+def _write_aria2_input(urls: list[str], out_dir: Path,
+                       segments: list[Segment] | None = None) -> Path:
+    """Write aria2c input file. Supports byte-range headers for SegmentBase MPDs."""
+    inp   = out_dir / "aria2_input.txt"
     lines = []
     for i, url in enumerate(urls):
+        seg   = segments[i] if segments else None
         fname = f"seg_{i:06d}{Path(urlparse(url).path).suffix or '.mp4'}"
         lines.append(url)
         lines.append(f"  out={fname}")
         lines.append(f"  dir={out_dir}")
+        if seg and seg.full_range:
+            lines.append(f"  header=Range: bytes={seg.full_range}")
         lines.append("")
     inp.write_text("\n".join(lines), encoding="utf-8")
     return inp
@@ -618,7 +693,8 @@ def _write_aria2_input(urls: list[str], out_dir: Path) -> Path:
 
 def _aria2c_download(urls: list[str], out_dir: Path,
                      connections: int = 16,
-                     label: str = "") -> list[Path]:
+                     label: str = "",
+                     segments: list[Segment] | None = None) -> list[Path]:
     """Download URLs with aria2c, showing a Rich progress bar."""
     import threading
     import time as _time
@@ -628,7 +704,7 @@ def _aria2c_download(urls: list[str], out_dir: Path,
     from rich.text import Text
 
     aria2c = _check_tool("aria2c")
-    inp    = _write_aria2_input(urls, out_dir)
+    inp    = _write_aria2_input(urls, out_dir, segments=segments)
 
     cmd = [
         aria2c,
@@ -639,8 +715,10 @@ def _aria2c_download(urls: list[str], out_dir: Path,
         "--continue=true",
         "--auto-file-renaming=false",
         "--console-log-level=warn",
-        "--summary-interval=0",      # suppress aria2c's own summary spam
+        "--summary-interval=0",
         "--download-result=hide",
+        "--retry-wait=3",
+        "--max-tries=5",
     ]
 
     log.info(f"{label or 'Downloading'}: {len(urls)} segments "
@@ -652,14 +730,18 @@ def _aria2c_download(urls: list[str], out_dir: Path,
     done_lock    = threading.Lock()
     finished_evt = threading.Event()
 
+    def _count_done() -> tuple[int, int]:
+        segs  = list(out_dir.glob("seg_*"))
+        count = len(segs)
+        size  = sum(p.stat().st_size for p in segs if p.is_file())
+        return count, size
+
     def _watch_progress() -> None:
         nonlocal done_segs, done_bytes
         while not finished_evt.is_set():
-            segs = list(out_dir.glob("seg_*.mp4"))
-            count = len(segs)
-            size = sum(p.stat().st_size for p in segs)
+            count, size = _count_done()
             with done_lock:
-                done_segs = count
+                done_segs  = count
                 done_bytes = size
             _time.sleep(0.5)
 
@@ -677,6 +759,11 @@ def _aria2c_download(urls: list[str], out_dir: Path,
                 return Text("— MB/s")
             mbps = bytes_done / 1024 / 1024 / elapsed
             return Text(f"{mbps:>6.2f} MB/s")
+
+    # Capture stderr so we can show it on failure
+    import tempfile as _tf
+    err_file = _tf.NamedTemporaryFile(mode="w+", suffix=".log",
+                                      delete=False, encoding="utf-8")
 
     with Progress(
         TextColumn(f"[bold cyan]{label or 'DL'}[/bold cyan]"),
@@ -697,45 +784,66 @@ def _aria2c_download(urls: list[str], out_dir: Path,
         )
 
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL)
+                                stderr=err_file)
         while proc.poll() is None:
             with done_lock:
-                current = done_segs
+                current       = done_segs
                 current_bytes = done_bytes
             progress.update(task, completed=current, bytes_done=current_bytes)
             _time.sleep(0.3)
 
         finished_evt.set()
-        # Final count
-        final_segs = list(out_dir.glob("seg_*.mp4"))
-        final_count = len(final_segs)
-        final_bytes = sum(p.stat().st_size for p in final_segs)
+        final_count, final_bytes = _count_done()
         progress.update(task, completed=final_count, bytes_done=final_bytes)
 
+    err_file.flush()
+    err_file.seek(0)
+    err_text = err_file.read().strip()
+    err_file.close()
+    Path(err_file.name).unlink(missing_ok=True)
+
     if proc.returncode not in (0, 7):
-        raise RuntimeError(f"aria2c failed with exit code {proc.returncode}")
+        if err_text:
+            log.error(f"aria2c output:\n{err_text[-2000:]}")
+        raise RuntimeError(f"aria2c failed (exit {proc.returncode})")
+
+    # Show warnings even on success so we know if any segments failed
+    if err_text and VERBOSITY >= 1:
+        for line in err_text.splitlines():
+            if any(w in line.lower() for w in ("error", "failed", "warn")):
+                log.warning(f"aria2c: {line.strip()}")
 
     # Exit code 7 = network error on some segments — retry missing ones
     if proc.returncode == 7:
         downloaded = {p.stem for p in out_dir.glob("seg_*")}
-        missing_urls = []
+        missing_segs  = []
+        missing_urls  = []
         for i, url in enumerate(urls):
             stem = f"seg_{i:06d}"
             if stem not in downloaded:
                 missing_urls.append(url)
+                missing_segs.append(segments[i] if segments else None)
 
         if missing_urls:
             log.warning(f"Retrying {len(missing_urls)} failed segments…")
-            retry_inp = _write_aria2_input(missing_urls, out_dir)
-            retry_cmd = cmd.copy()
-            retry_cmd[retry_cmd.index(f"--input-file={inp}")] = \
-                f"--input-file={retry_inp}"
-            retry_cmd += ["--retry-wait=3", "--max-tries=5"]
+            retry_inp = _write_aria2_input(missing_urls, out_dir,
+                                           segments=missing_segs if segments else None)
+            retry_cmd = [
+                aria2c,
+                f"--input-file={retry_inp}",
+                f"--max-connection-per-server={connections}",
+                f"--split={connections}",
+                "--min-split-size=1M",
+                "--continue=true",
+                "--auto-file-renaming=false",
+                "--retry-wait=5",
+                "--max-tries=8",
+            ]
             result = subprocess.run(retry_cmd, check=False)
             if result.returncode not in (0, 7):
                 raise RuntimeError(
                     f"aria2c retry failed (exit {result.returncode}). "
-                    "Check network or try --conn 4 to reduce parallel connections."
+                    "Try --conn 4 to reduce parallel connections."
                 )
 
     return sorted(out_dir.glob("seg_*"))
@@ -947,6 +1055,14 @@ async def download_content(
                 f"{len(a_tracks)}A "
                 f"{len([t for t in tracks if t.kind=='subtitle'])}S tracks")
 
+    # Warn if any tracks have 0 segments — usually means bad duration
+    zero_seg = [t for t in tracks if len(t.segments) == 0]
+    if zero_seg:
+        log.warning(
+            f"{len(zero_seg)} track(s) have 0 segments — "
+            f"MPD may be missing mediaPresentationDuration"
+        )
+
     # Quality availability check
     avail_codecs  = {(t.codec or "").lower() for t in v_tracks}
     wants_hevc    = range_mode in ("DV", "HDR10", "HDR")
@@ -999,9 +1115,18 @@ async def download_content(
             import urllib.request as _ur
             init_path = track_dir / "init.mp4"
             log.info(f"[{label}] init segment…")
-            _ur.urlretrieve(track.init_url, init_path)
+            # SegmentBase: init is a byte range of the same file
+            init_range = track.segments[0].init_range if track.segments else ""
+            if init_range:
+                req = _ur.Request(track.init_url,
+                                  headers={"Range": f"bytes={init_range}"})
+                with _ur.urlopen(req) as resp:
+                    init_path.write_bytes(resp.read())
+            else:
+                _ur.urlretrieve(track.init_url, init_path)
             seg_urls = [s.url for s in track.segments]
-            _aria2c_download(seg_urls, track_dir, connections, label=label)
+            _aria2c_download(seg_urls, track_dir, connections,
+                             label=label, segments=track.segments)
             segs    = sorted(track_dir.glob("seg_*"))
             out_raw = tmp / f"{label}.mp4"
             _concat_segments(init_path, segs, out_raw)
