@@ -22,8 +22,8 @@ A production-ready CLI tool for downloading movies and shows from ZEE5, with ful
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/ShubuYeole/zee5.git
-cd zee5
+git clone https://github.com/ShubuYeole/zee5-dl.git
+cd zee5-dl
 ```
 
 ### 2. Create a virtual environment and install dependencies
