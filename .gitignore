@@ -1,0 +1,40 @@
+# Virtual environment
+.venv/
+
+# Session / auth (sensitive — never commit these)
+session.json
+cookies.pkl
+.key
+zee5.yml
+
+# Widevine (never commit device files or certs)
+device/
+
+# Downloads and temp
+download/
+tmp/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+
+# Poetry
+poetry.lock
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
